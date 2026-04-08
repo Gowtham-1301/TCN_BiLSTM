@@ -218,8 +218,6 @@ pytest tests/ -v --tb=short         # short traceback
 
 **PULSE AI Team — KCG College of Technology, Chennai**
 - Gowtham N
-- Mathew Shaun Rosario  
-- Haggith Joshua E
 
 ---
 
