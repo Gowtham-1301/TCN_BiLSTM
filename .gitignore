@@ -1,0 +1,19 @@
+# Python virtual environments
+.venv/
+.venv-gpu/
+venv/
+env/
+
+# Datasets and generated artifacts
+data/
+.data/
+logs/
+models/
+evaluation/
+
+# Python cache and bytecode
+__pycache__/
+*.pyc
+
+# Local run outputs
+train.log

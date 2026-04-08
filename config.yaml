@@ -1,0 +1,60 @@
+# ============================================================
+# PULSE ECG Beat Classifier — Training Configuration
+# ============================================================
+
+# ----- Data -----
+data:
+  raw_path: "./data/raw"
+  processed_path: "./data/processed"
+  metadata_path: "./data/metadata"
+  sampling_rate: 360          # Hz — target after resampling
+  window_size: 360            # samples = 1 second @ 360 Hz
+  lead: "II"                  # preferred lead
+
+# ----- Classes -----
+classes:
+  num_classes: 5
+  names: ["Normal", "SVEB", "VEB", "Fusion", "Unknown"]
+  # indices: 0=Normal, 1=SVEB, 2=VEB, 3=Fusion, 4=Unknown
+
+# ----- Training -----
+training:
+  learning_rate: 0.001
+  batch_size: 64
+  epochs: 100
+  patience: 7                 # early stopping patience
+  lr_reduce_patience: 5
+  lr_reduce_factor: 0.5
+  min_lr: 0.00001
+  test_size: 0.15
+  val_size: 0.15
+  random_seed: 42
+  augmentations_per_sample: 3
+
+# ----- Class weights (handles imbalance) -----
+class_weights:
+  "0": 0.5     # Normal — most common
+  "1": 5.0     # SVEB
+  "2": 4.0     # VEB
+  "3": 8.0     # Fusion — rare
+  "4": 10.0    # Unknown — very rare
+
+# ----- Model -----
+model:
+  input_shape: [360, 1]
+  conv1_filters: 32
+  conv2_filters: 64
+  kernel_size: 5
+  lstm_units: 64
+  dense_units: 32
+  dropout_conv: 0.3
+  dropout_lstm: 0.4
+  dropout_dense: 0.3
+  l2_reg: 0.0001
+
+# ----- Paths -----
+paths:
+  model_h5: "./models/ecg_beat_classifier.h5"
+  tfjs_dir: "./models/tfjs_model"
+  logs_dir: "./logs"
+  checkpoints_dir: "./checkpoints"

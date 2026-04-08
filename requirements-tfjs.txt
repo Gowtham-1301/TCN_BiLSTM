@@ -1,0 +1,5 @@
+# Optional TFJS conversion environment
+# Use this in a separate Python 3.11 venv for model conversion.
+# This package set currently conflicts with TensorFlow 2.16.x on Python 3.12.
+tensorflow==2.15.1
+tensorflowjs==4.11.0
