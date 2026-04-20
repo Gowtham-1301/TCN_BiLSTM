@@ -7,6 +7,7 @@ Comprehensive evaluation:
   • ROC-AUC per class
   • Clinical metrics: VEB sensitivity, SVEB specificity
   • JSON report export
+  • Support for dual-input models (ECG + metadata)
 
 Author : PULSE AI Team — KCG College of Technology
 """
@@ -33,9 +34,11 @@ CLASS_NAMES = ["Normal", "SVEB", "VEB", "Fusion", "Unknown"]
 class ECGModelEvaluator:
     """Evaluate trained ECG beat classifier on any labelled test set."""
 
-    def __init__(self, model, output_dir: str = "./evaluation"):
-        self.model      = model
-        self.output_dir = Path(output_dir)
+    def __init__(self, model, output_dir: str = "./evaluation",
+                 use_metadata: bool = False):
+        self.model       = model
+        self.output_dir  = Path(output_dir)
+        self.use_metadata = use_metadata
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── helpers ──────────────────────────────────────────────────────────────
@@ -50,7 +53,7 @@ class ECGModelEvaluator:
 
     def evaluate(
         self,
-        X: np.ndarray,
+        X,
         y: np.ndarray,
         dataset_name: str = "Test",
         save_plots: bool  = True,
@@ -60,7 +63,7 @@ class ECGModelEvaluator:
 
         Parameters
         ----------
-        X            : (N, 360, 1) float32
+        X            : (N, 360, 1) or [ecg_array, metadata_array]
         y            : (N, 5) one-hot  OR  (N,) integer labels
         dataset_name : label used in plots / JSON
         save_plots   : save confusion matrix and ROC curves as PNG
@@ -70,7 +73,8 @@ class ECGModelEvaluator:
         dict with accuracy, macro_f1, per_class, roc_auc, cm
         """
         log.info("=" * 70)
-        log.info("EVALUATING ON: %s  (n=%d)", dataset_name, len(X))
+        n_samples = len(X[0]) if isinstance(X, (list, tuple)) else len(X)
+        log.info("EVALUATING ON: %s  (n=%d)", dataset_name, n_samples)
         log.info("=" * 70)
 
         # ── inference ────────────────────────────────────────────────────────
@@ -128,7 +132,7 @@ class ECGModelEvaluator:
 
         results = {
             "dataset":        dataset_name,
-            "n_samples":      int(len(X)),
+            "n_samples":      int(n_samples),
             "accuracy":       accuracy,
             "macro_f1":       macro_f1,
             "roc_auc":        roc_auc,
@@ -228,16 +232,19 @@ class ECGModelEvaluator:
 if __name__ == "__main__":
     import sys, numpy as np
     sys.path.insert(0, ".")
-    from src.model import build_ecg_beat_classifier
+    from src.model import build_tcn_bilstm_attention
     import tensorflow as tf
 
     rng = np.random.default_rng(99)
-    m   = build_ecg_beat_classifier()
+
+    # Test with metadata
+    m = build_tcn_bilstm_attention(use_metadata=True)
     m.compile("adam", "categorical_crossentropy", ["accuracy"])
 
-    X = rng.random((200, 360, 1)).astype(np.float32)
-    y = tf.keras.utils.to_categorical(rng.integers(0, 5, 200), 5)
+    X_ecg  = rng.random((200, 360, 1)).astype(np.float32)
+    X_meta = rng.random((200, 4)).astype(np.float32)
+    y      = tf.keras.utils.to_categorical(rng.integers(0, 5, 200), 5)
 
-    ev = ECGModelEvaluator(m, "./evaluation_test")
-    r  = ev.evaluate(X, y, "Smoke Test", save_plots=False)
+    ev = ECGModelEvaluator(m, "./evaluation_test", use_metadata=True)
+    r  = ev.evaluate([X_ecg, X_meta], y, "Smoke Test", save_plots=False)
     log.info("Smoke-test evaluate: acc=%.4f", r["accuracy"])

@@ -1,5 +1,6 @@
 # ============================================================
 # PULSE ECG Beat Classifier — Training Configuration
+# Architecture: TCN-BiLSTM + Self-Attention + Metadata Fusion
 # ============================================================
 
 # ----- Data -----
@@ -16,6 +17,31 @@ classes:
   num_classes: 5
   names: ["Normal", "SVEB", "VEB", "Fusion", "Unknown"]
   # indices: 0=Normal, 1=SVEB, 2=VEB, 3=Fusion, 4=Unknown
+
+# ----- Patient Metadata -----
+metadata:
+  enabled: true
+  dim: 4                      # [age_norm, sex_encoded, height_norm, weight_norm]
+  features: ["age", "sex", "height", "weight"]
+
+# ----- TCN Architecture -----
+tcn:
+  filters: [32, 64, 128]     # per-stage filter counts
+  kernels: [5, 5, 3]         # per-stage kernel sizes
+  dilations:                  # exponential dilation per stage
+    - [1, 2, 4, 8]
+    - [1, 2, 4, 8]
+    - [1, 2, 4]
+  dropout: 0.2                # spatial dropout in TCN blocks
+
+# ----- BiLSTM -----
+bilstm:
+  units: 64                   # per direction (total output = 128)
+  dropout: 0.4
+
+# ----- Attention -----
+attention:
+  units: 128                  # projection dimension
 
 # ----- Training -----
 training:
@@ -39,16 +65,10 @@ class_weights:
   "3": 8.0     # Fusion — rare
   "4": 10.0    # Unknown — very rare
 
-# ----- Model -----
+# ----- Dense Head -----
 model:
   input_shape: [360, 1]
-  conv1_filters: 32
-  conv2_filters: 64
-  kernel_size: 5
-  lstm_units: 64
-  dense_units: 32
-  dropout_conv: 0.3
-  dropout_lstm: 0.4
+  dense_units: [64, 32]
   dropout_dense: 0.3
   l2_reg: 0.0001
 

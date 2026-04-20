@@ -9,6 +9,7 @@ Complete training loop with:
   • TensorBoard logging
   • Per-epoch macro-F1 custom metric
   • Class-weighted loss
+  • Support for dual-input models (ECG + metadata)
 
 Author : PULSE AI Team — KCG College of Technology
 """
@@ -114,12 +115,16 @@ class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Main Trainer
+# Main Trainer (supports single-input and dual-input models)
 # ═════════════════════════════════════════════════════════════════════════════
 
 class ECGModelTrainer:
     """
     Compile and train the ECG beat classifier.
+
+    Supports both:
+      - Single input:  X_train is (N, 360, 1)
+      - Dual input:    X_train is [ecg_array, metadata_array]
 
     Parameters
     ----------
@@ -227,11 +232,17 @@ class ECGModelTrainer:
 
     # ------------------------------------------------------------------
 
+    def _get_n_samples(self, X) -> int:
+        """Get number of samples from single array or list of arrays."""
+        if isinstance(X, (list, tuple)):
+            return len(X[0])
+        return len(X)
+
     def train(
         self,
-        X_train: np.ndarray,
+        X_train,
         y_train: np.ndarray,
-        X_val:   np.ndarray,
+        X_val,
         y_val:   np.ndarray,
     ) -> tf.keras.callbacks.History:
         """
@@ -239,8 +250,8 @@ class ECGModelTrainer:
 
         Parameters
         ----------
-        X_train, X_val : (N, 360, 1)  float32
-        y_train, y_val : (N, 5)       float32  one-hot
+        X_train, X_val : (N, 360, 1) or list of [ecg, metadata] arrays
+        y_train, y_val : (N, 5) float32 one-hot
 
         Returns
         -------
@@ -248,13 +259,19 @@ class ECGModelTrainer:
         """
         cfg = self.config
 
+        n_train = self._get_n_samples(X_train)
+
         if not self._compiled:
-            steps_per_epoch = max(1, len(X_train) // cfg["batch_size"])
+            steps_per_epoch = max(1, n_train // cfg["batch_size"])
             self.compile(total_steps=steps_per_epoch * cfg["epochs"])
 
         log.info("=" * 70)
         log.info("TRAINING — samples: %d  val: %d  batch: %d  max_epochs: %d",
-                 len(X_train), len(X_val), cfg["batch_size"], cfg["epochs"])
+                 n_train, self._get_n_samples(X_val),
+                 cfg["batch_size"], cfg["epochs"])
+        if isinstance(X_train, (list, tuple)):
+            log.info("  Dual-input mode: ECG %s + Metadata %s",
+                     X_train[0].shape, X_train[1].shape)
         log.info("=" * 70)
 
         history = self.model.fit(
@@ -287,13 +304,18 @@ class ECGModelTrainer:
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, ".")
-    from src.model import build_ecg_beat_classifier
+    from src.model import build_tcn_bilstm_attention
 
     rng = np.random.default_rng(0)
-    X   = rng.random((200, 360, 1)).astype(np.float32)
-    y   = tf.keras.utils.to_categorical(rng.integers(0, 5, 200), 5).astype(np.float32)
+    X_ecg  = rng.random((200, 360, 1)).astype(np.float32)
+    X_meta = rng.random((200, 4)).astype(np.float32)
+    y      = tf.keras.utils.to_categorical(rng.integers(0, 5, 200), 5).astype(np.float32)
 
-    m = build_ecg_beat_classifier()
+    # Test dual-input
+    m = build_tcn_bilstm_attention(use_metadata=True)
     t = ECGModelTrainer(m, {"epochs": 3, "batch_size": 32})
-    h = t.train(X[:160], y[:160], X[160:], y[160:])
+    h = t.train(
+        [X_ecg[:160], X_meta[:160]], y[:160],
+        [X_ecg[160:], X_meta[160:]], y[160:]
+    )
     log.info("Smoke-test complete — final val_loss: %.4f", h.history["val_loss"][-1])

@@ -3,6 +3,8 @@ src/converter.py
 ================
 Export the trained Keras model to TensorFlow.js (browser-ready).
 
+Supports TCN-BiLSTM-Attention with optional metadata input.
+
 Outputs
 -------
   models/tfjs_model/model.json           — architecture + weight manifest
@@ -107,7 +109,7 @@ class TFJSConverter:
 
     # ------------------------------------------------------------------
 
-    def validate(self) -> bool:
+    def validate(self, use_metadata: bool = False) -> bool:
         """
         Load the exported TF.js model back with tensorflowjs_converter
         (SavedModel round-trip) and run a dummy forward pass.
@@ -121,10 +123,16 @@ class TFJSConverter:
             import tensorflowjs as tfjs
             import tensorflow as tf
 
-            tmp_h5 = self.output_dir / "_validate_tmp.h5"
             model  = tfjs.converters.load_keras_model(str(model_json))
-            dummy  = np.zeros((1, 360, 1), dtype=np.float32)
-            out    = model(dummy, training=False)
+
+            if use_metadata:
+                dummy_ecg  = np.zeros((1, 360, 1), dtype=np.float32)
+                dummy_meta = np.zeros((1, 4), dtype=np.float32)
+                out = model([dummy_ecg, dummy_meta], training=False)
+            else:
+                dummy = np.zeros((1, 360, 1), dtype=np.float32)
+                out = model(dummy, training=False)
+
             assert out.shape == (1, 5), f"Unexpected output shape: {out.shape}"
             log.info("✓  TF.js model validation passed — output shape: %s", out.shape)
             return True
@@ -135,13 +143,15 @@ class TFJSConverter:
 
     # ------------------------------------------------------------------
 
-    def write_integration_snippet(self) -> str:
+    def write_integration_snippet(self, use_metadata: bool = False) -> str:
         """
-        Write a JavaScript snippet showing how to load and call the model
+        Write a TypeScript snippet showing how to load and call the model
         in the PULSE React/TypeScript web app.
         """
-        snippet = """\
-// ── PULSE ECG Classifier — TF.js integration snippet ──────────────────────
+        if use_metadata:
+            snippet = """\
+// ── PULSE ECG Classifier — TF.js integration (with Patient Metadata) ──────
+// Architecture: TCN-BiLSTM + Self-Attention + Metadata Fusion
 // Install: npm install @tensorflow/tfjs
 //
 // Place model.json + *.bin inside  public/tfjs_model/
@@ -154,7 +164,82 @@ let model: tf.LayersModel | null = null;
 
 export async function loadECGModel(): Promise<void> {
   model = await tf.loadLayersModel(MODEL_URL);
-  console.log('PULSE ECG model loaded ✓');
+  console.log('PULSE ECG model loaded ✓ (TCN-BiLSTM-Attention + Metadata)');
+}
+
+/**
+ * Patient metadata interface.
+ * All fields are optional — defaults to 0.5 (unknown) if not provided.
+ */
+export interface PatientMetadata {
+  age?: number;       // years (0–100)
+  sex?: 'male' | 'female' | 'unknown';
+  height?: number;    // cm (100–220)
+  weight?: number;    // kg (30–200)
+}
+
+/**
+ * Normalise patient metadata into the format the model expects.
+ */
+function encodeMetadata(meta: PatientMetadata = {}): Float32Array {
+  const ageNorm   = meta.age    != null ? Math.min(meta.age / 100, 1)                  : 0.5;
+  const sexEnc    = meta.sex === 'male' ? 1 : meta.sex === 'female' ? 0                : 0.5;
+  const heightNorm = meta.height != null ? Math.min((meta.height - 100) / 120, 1)      : 0.5;
+  const weightNorm = meta.weight != null ? Math.min((meta.weight - 30) / 170, 1)       : 0.5;
+  return new Float32Array([ageNorm, sexEnc, heightNorm, weightNorm]);
+}
+
+/**
+ * Classify a 1-second ECG window with patient context.
+ *
+ * @param window  Float32Array of 360 samples, normalised to [0, 1]
+ * @param meta    Optional patient metadata (age, sex, height, weight)
+ * @returns       Array of 5 probabilities [Normal, SVEB, VEB, Fusion, Unknown]
+ */
+export async function classifyBeat(
+  window: Float32Array,
+  meta: PatientMetadata = {}
+): Promise<number[]> {
+  if (!model) await loadECGModel();
+
+  const ecgInput  = tf.tensor3d(window, [1, 360, 1]);
+  const metaInput = tf.tensor2d(encodeMetadata(meta), [1, 4]);
+  const output    = model!.predict([ecgInput, metaInput]) as tf.Tensor;
+  const probs     = await output.data() as Float32Array;
+
+  ecgInput.dispose();
+  metaInput.dispose();
+  output.dispose();
+
+  return Array.from(probs);
+}
+
+/** Labels in the same order as model output */
+export const BEAT_LABELS = ['Normal', 'SVEB', 'VEB', 'Fusion', 'Unknown'];
+
+// Example usage:
+//
+// const probs = await classifyBeat(ecgWindow, { age: 65, sex: 'male' });
+// const predicted = BEAT_LABELS[probs.indexOf(Math.max(...probs))];
+// ─────────────────────────────────────────────────────────────────────────────
+"""
+        else:
+            snippet = """\
+// ── PULSE ECG Classifier — TF.js integration snippet ──────────────────────
+// Architecture: TCN-BiLSTM + Self-Attention
+// Install: npm install @tensorflow/tfjs
+//
+// Place model.json + *.bin inside  public/tfjs_model/
+// or host them on Firebase Storage and use the full URL.
+
+import * as tf from '@tensorflow/tfjs';
+
+const MODEL_URL = '/tfjs_model/model.json';   // or full HTTPS URL
+let model: tf.LayersModel | null = null;
+
+export async function loadECGModel(): Promise<void> {
+  model = await tf.loadLayersModel(MODEL_URL);
+  console.log('PULSE ECG model loaded ✓ (TCN-BiLSTM-Attention)');
 }
 
 /**
@@ -198,10 +283,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert Keras model to TF.js")
     parser.add_argument("--model", default="./models/ecg_beat_classifier.h5")
     parser.add_argument("--output", default="./models/tfjs_model")
+    parser.add_argument("--metadata", action="store_true",
+                        help="Model uses metadata input")
     args = parser.parse_args()
 
     conv = TFJSConverter(output_dir=args.output)
     ok   = conv.convert(args.model)
     if ok:
-        conv.validate()
-        conv.write_integration_snippet()
+        conv.validate(use_metadata=args.metadata)
+        conv.write_integration_snippet(use_metadata=args.metadata)

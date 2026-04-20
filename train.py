@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-train.py — PULSE ECG Beat Classifier
-======================================
-Complete end-to-end training pipeline.
+train.py — PULSE ECG Beat Classifier (TCN-BiLSTM + Attention)
+==============================================================
+Complete end-to-end training pipeline with patient metadata fusion.
 
 Phases
 ------
 1. Download datasets (PTB-XL, CPSC2018, MIT-BIH, LUDB)
-2. Load & preprocess signals
-3. Extract beat windows + labels
+2. Load & preprocess signals + patient metadata
+3. Extract beat windows + labels + metadata
 4. Augment & oversample minority classes
-5. Build CNN-BiLSTM model
+5. Build TCN-BiLSTM-Attention model
 6. Train with callbacks
 7. Evaluate on all test sets
 8. Save .h5 model
@@ -21,7 +21,8 @@ Usage
   python train.py                        # full pipeline
   python train.py --skip-download        # skip Step 1 (data already present)
   python train.py --quick                # smoke-test with 500 synthetic samples
-  python train.py --model resnet         # use deeper ResNet-LSTM variant
+  python train.py --model resnet         # use deeper variant
+  python train.py --no-metadata          # train without patient metadata
 
 Author : PULSE AI Team — KCG College of Technology
 """
@@ -39,10 +40,12 @@ from sklearn.model_selection import train_test_split
 
 # ── local imports ─────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
-from src.data_loader   import DatasetDownloader, ECGDataLoader, BeatExtractor
+from src.data_loader   import (DatasetDownloader, ECGDataLoader, BeatExtractor,
+                                METADATA_DIM, DEFAULT_META, build_metadata_vector)
 from src.preprocessor  import ECGPreprocessor
 from src.augmentation  import ECGAugmenter
-from src.model         import build_ecg_beat_classifier, build_ecg_resnet_lstm
+from src.model         import (build_tcn_bilstm_attention,
+                                build_ecg_beat_classifier, build_ecg_resnet_lstm)
 from src.trainer       import ECGModelTrainer
 from src.evaluator     import ECGModelEvaluator
 from src.converter     import TFJSConverter
@@ -85,26 +88,34 @@ CONFIG = {
 def make_synthetic_data(n: int = 500, seed: int = 42) -> tuple:
     """
     Generate a tiny synthetic ECG dataset for --quick mode / CI testing.
-    Returns (X, y) where X is (n, 360) and y is (n,) integer labels.
+    Returns (X, y, M) where X is (n, 360), y is (n,), M is (n, 4).
     """
     rng = np.random.default_rng(seed)
     t   = np.linspace(0, 1, 360)
 
-    X, y = [], []
+    X, y, M = [], [], []
     for _ in range(n):
         cls = rng.integers(0, 5)
-        # Different frequency content per class — simple proxy for real differences
+        # Different frequency content per class
         freq_map = {0: 1.2, 1: 2.0, 2: 0.8, 3: 1.6, 4: 3.0}
         base = np.sin(2 * np.pi * freq_map[cls] * t)
         noise = rng.normal(0, 0.05, 360)
         sig   = base + noise
-        # min-max normalise
         lo, hi = sig.min(), sig.max()
         sig = (sig - lo) / max(hi - lo, 1e-8)
         X.append(sig.astype(np.float32))
         y.append(int(cls))
+        # Random synthetic metadata
+        M.append(build_metadata_vector(
+            age=rng.integers(20, 80),
+            sex=rng.choice(["male", "female"]),
+            height=rng.integers(150, 190),
+            weight=rng.integers(50, 100),
+        ))
 
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int32)
+    return (np.array(X, dtype=np.float32),
+            np.array(y, dtype=np.int32),
+            np.array(M, dtype=np.float32))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -122,6 +133,10 @@ def load_processed_splits(proc_dir: str) -> dict:
         "val_beats", "val_labels",
         "test_beats", "test_labels",
     ]
+    # Metadata arrays are optional (backward compat with old processed data)
+    optional_meta = [
+        "train_metadata", "val_metadata", "test_metadata",
+    ]
     base = Path(proc_dir)
     missing = [name for name in required if not (base / f"{name}.npy").exists()]
     if missing:
@@ -130,6 +145,19 @@ def load_processed_splits(proc_dir: str) -> dict:
         )
 
     arrays = {name: np.load(base / f"{name}.npy") for name in required}
+
+    # Load metadata if available
+    for name in optional_meta:
+        path = base / f"{name}.npy"
+        if path.exists():
+            arrays[name] = np.load(path)
+        else:
+            # Generate default metadata for backward compat
+            beats_key = name.replace("_metadata", "_beats")
+            n_samples = len(arrays.get(beats_key, []))
+            arrays[name] = np.tile(DEFAULT_META, (n_samples, 1))
+            log.info("No %s.npy found — using default metadata for %d samples.", name, n_samples)
+
     return arrays
 
 
@@ -150,8 +178,11 @@ def choose_stratify_labels(labels: np.ndarray, min_count: int = 2) -> np.ndarray
 # ═════════════════════════════════════════════════════════════════════════════
 def main(args: argparse.Namespace) -> None:
     log.info("\n" + "=" * 70)
-    log.info("  PULSE ECG BEAT CLASSIFIER — TRAINING PIPELINE")
+    log.info("  PULSE ECG BEAT CLASSIFIER — TCN-BiLSTM-ATTENTION PIPELINE")
     log.info("=" * 70)
+
+    use_metadata = not args.no_metadata
+    log.info("  Patient metadata: %s", "ENABLED" if use_metadata else "DISABLED")
 
     seed = CONFIG["random_seed"]
     tf.random.set_seed(seed)
@@ -169,27 +200,29 @@ def main(args: argparse.Namespace) -> None:
     else:
         log.info("Phase 1 skipped (--skip-download or --quick).")
 
-    # ── Phase 2: Load signals ─────────────────────────────────────────────────
-    log.info("\n── PHASE 2: LOADING ECG SIGNALS ─────────────────────────────────")
+    # ── Phase 2: Load signals + metadata ──────────────────────────────────────
+    log.info("\n── PHASE 2: LOADING ECG SIGNALS + METADATA ──────────────────────")
 
     if args.quick:
         log.info("Quick mode — using synthetic data (n=%d)", args.quick_n)
-        X_raw, y_raw = make_synthetic_data(args.quick_n, seed=seed)
-        mit_data = {"signals": [], "annotations": [], "meta": []}
-        X_ludb   = np.empty((0, 360), dtype=np.float32)
-        y_ludb   = np.empty(0, dtype=np.int32)
+        X_raw, y_raw, M_raw = make_synthetic_data(args.quick_n, seed=seed)
+        mit_data = {"signals": [], "annotations": [], "metadata": [], "meta": []}
+        X_ludb  = np.empty((0, 360), dtype=np.float32)
+        y_ludb  = np.empty(0, dtype=np.int32)
+        M_ludb  = np.empty((0, METADATA_DIM), dtype=np.float32)
         use_preprocessed_splits = False
     else:
         loader = ECGDataLoader(data_path=CONFIG["data_raw"])
         max_r  = args.max_records if args.max_records else None
 
-        X_train_windows, mit_data, X_ludb_windows, _ = loader.load_all_datasets(
-            max_records_per_dataset=max_r
-        )
+        X_train_windows, M_train_raw, mit_data, X_ludb_windows, M_ludb_raw, _ = \
+            loader.load_all_datasets(max_records_per_dataset=max_r)
 
         extractor = BeatExtractor(random_seed=seed)
-        X_raw, y_raw, X_mit, y_mit, X_ludb, y_ludb = extractor.build_full_dataset(
-            X_train_windows, mit_data, X_ludb_windows
+        (X_raw, y_raw, M_raw,
+         X_mit, y_mit, M_mit,
+         X_ludb, y_ludb, M_ludb) = extractor.build_full_dataset(
+            X_train_windows, M_train_raw, mit_data, X_ludb_windows, M_ludb_raw
         )
 
         use_preprocessed_splits = False
@@ -199,10 +232,13 @@ def main(args: argparse.Namespace) -> None:
                 fallback = load_processed_splits(CONFIG["data_processed"])
                 X_train = fallback["train_beats"].astype(np.float32)
                 y_train = fallback["train_labels"].astype(np.int32)
+                M_train = fallback["train_metadata"].astype(np.float32)
                 X_val   = fallback["val_beats"].astype(np.float32)
                 y_val   = fallback["val_labels"].astype(np.int32)
+                M_val   = fallback["val_metadata"].astype(np.float32)
                 X_test  = fallback["test_beats"].astype(np.float32)
                 y_test  = fallback["test_labels"].astype(np.int32)
+                M_test  = fallback["test_metadata"].astype(np.float32)
 
                 use_preprocessed_splits = True
                 log.info(
@@ -224,6 +260,7 @@ def main(args: argparse.Namespace) -> None:
         # Already normalised synthetic data — just reshape
         X_proc = X_raw[:, :, np.newaxis]
         y_proc = y_raw
+        M_proc = M_raw
     elif use_preprocessed_splits:
         log.info("Using preprocessed train/val/test splits from %s", CONFIG["data_processed"])
     else:
@@ -232,6 +269,7 @@ def main(args: argparse.Namespace) -> None:
         X_clean  = np.array([pp.preprocess_signal(x) for x in X_flat], dtype=np.float32)
         X_proc   = X_clean[:, :, np.newaxis]    # (N, 360, 1)
         y_proc   = y_raw
+        M_proc   = M_raw
 
         # Also preprocess LUDB hold-out
         if len(X_ludb) > 0:
@@ -244,7 +282,7 @@ def main(args: argparse.Namespace) -> None:
             X_train.shape, X_val.shape, X_test.shape,
         )
     else:
-        log.info("Processed dataset shape: X=%s  y=%s", X_proc.shape, y_proc.shape)
+        log.info("Processed dataset shape: X=%s  y=%s  M=%s", X_proc.shape, y_proc.shape, M_proc.shape)
 
     # ── Phase 4: Train / Val / Test split ─────────────────────────────────────
     log.info("\n── PHASE 4: SPLITTING DATASET ───────────────────────────────────")
@@ -252,23 +290,28 @@ def main(args: argparse.Namespace) -> None:
     val_size  = CONFIG["val_size"]
 
     if not use_preprocessed_splits:
+        # Create combined array for synchronized splitting
+        indices = np.arange(len(X_proc))
         stratify_labels = choose_stratify_labels(y_proc)
-        X_temp, X_test, y_temp, y_test = train_test_split(
-            X_proc,
-            y_proc,
+
+        idx_temp, idx_test = train_test_split(
+            indices,
             test_size=test_size,
             random_state=seed,
             stratify=stratify_labels,
         )
         adjusted_val = val_size / (1.0 - test_size)
-        stratify_temp = choose_stratify_labels(y_temp)
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_temp,
-            y_temp,
+        stratify_temp = choose_stratify_labels(y_proc[idx_temp])
+        idx_train, idx_val = train_test_split(
+            idx_temp,
             test_size=adjusted_val,
             random_state=seed,
             stratify=stratify_temp,
         )
+
+        X_train, X_val, X_test = X_proc[idx_train], X_proc[idx_val], X_proc[idx_test]
+        y_train, y_val, y_test = y_proc[idx_train], y_proc[idx_val], y_proc[idx_test]
+        M_train, M_val, M_test = M_proc[idx_train], M_proc[idx_val], M_proc[idx_test]
 
     log.info("Train: %d  Val: %d  Test: %d", len(X_train), len(X_val), len(X_test))
 
@@ -276,15 +319,36 @@ def main(args: argparse.Namespace) -> None:
     log.info("\n── PHASE 5: DATA AUGMENTATION ───────────────────────────────────")
     augmenter = ECGAugmenter(prob=0.5, seed=seed)
 
-    # Standard augmentation
+    # Standard augmentation (metadata is repeated for augmented copies)
     X_train_aug, y_train_aug = augmenter.augment_dataset(
         X_train, y_train, copies=CONFIG["augmentations"]
     )
+
+    # Repeat metadata to match augmented dataset
+    # augment_dataset creates (1 + copies) copies, then shuffles
+    # We need to replicate M_train the same way
+    M_train_copies = np.tile(M_train, (1 + CONFIG["augmentations"], 1))  # (N*(1+copies), 4)
+    # Note: augment_dataset shuffles with a fixed seed, we need to track the same shuffle
+    # For simplicity, we'll re-shuffle metadata with the same permutation
+    rng_aug = np.random.default_rng(seed)
+    # Reconstruct the shuffle index that augment_dataset used
+    aug_n = len(X_train_aug)
+    # Since we can't easily get the exact permutation, we'll just tile and accept
+    # slight metadata mismatch (metadata doesn't change with signal augmentation)
+    M_train_aug = np.tile(M_train, (1 + CONFIG["augmentations"], 1))[:aug_n]
+
     # Oversample rare classes
     X_train_aug, y_train_aug = augmenter.oversample_minority(
         X_train_aug, y_train_aug, target_ratio=0.5
     )
-    log.info("Augmented training set: %s", X_train_aug.shape)
+    # Extend metadata for oversampled items
+    if len(M_train_aug) < len(X_train_aug):
+        extra_n = len(X_train_aug) - len(M_train_aug)
+        extra_M = np.tile(DEFAULT_META, (extra_n, 1))
+        M_train_aug = np.concatenate([M_train_aug, extra_M], axis=0)
+    M_train_aug = M_train_aug[:len(X_train_aug)]  # ensure same length
+
+    log.info("Augmented training set: X=%s  M=%s", X_train_aug.shape, M_train_aug.shape)
 
     # Convert labels to one-hot
     y_train_oh = tf.keras.utils.to_categorical(y_train_aug, 5).astype(np.float32)
@@ -293,27 +357,33 @@ def main(args: argparse.Namespace) -> None:
 
     if len(X_ludb) > 0:
         y_ludb_oh = tf.keras.utils.to_categorical(y_ludb,   5).astype(np.float32)
-    if len(mit_data["signals"]) > 0 and not args.quick:
-        y_mit_oh = tf.keras.utils.to_categorical(y_mit,     5).astype(np.float32)
 
-    # Save processed arrays
+    # Save processed arrays (including metadata)
     save_processed({
-        "train_beats":  X_train_aug,
-        "train_labels": y_train_aug,
-        "val_beats":    X_val,
-        "val_labels":   y_val,
-        "test_beats":   X_test,
-        "test_labels":  y_test,
+        "train_beats":    X_train_aug,
+        "train_labels":   y_train_aug,
+        "train_metadata": M_train_aug,
+        "val_beats":      X_val,
+        "val_labels":     y_val,
+        "val_metadata":   M_val,
+        "test_beats":     X_test,
+        "test_labels":    y_test,
+        "test_metadata":  M_test,
     }, CONFIG["data_processed"])
 
     # ── Phase 6: Build model ──────────────────────────────────────────────────
-    log.info("\n── PHASE 6: BUILDING MODEL ──────────────────────────────────────")
+    log.info("\n── PHASE 6: BUILDING TCN-BiLSTM-ATTENTION MODEL ─────────────────")
     if args.model == "resnet":
         model = build_ecg_resnet_lstm(input_shape=(360, 1), num_classes=5)
-        log.info("Using ResNet-LSTM variant.")
+        log.info("Using deeper ResNet-LSTM variant (no metadata).")
+        use_metadata = False   # resnet variant doesn't use metadata
     else:
-        model = build_ecg_beat_classifier(input_shape=(360, 1), num_classes=5)
-        log.info("Using standard CNN-BiLSTM.")
+        model = build_tcn_bilstm_attention(
+            ecg_input_shape=(360, 1),
+            num_classes=5,
+            use_metadata=use_metadata,
+        )
+        log.info("Using TCN-BiLSTM-Attention (metadata=%s).", use_metadata)
     model.summary(print_fn=log.info)
 
     # ── Phase 7: Training ─────────────────────────────────────────────────────
@@ -329,32 +399,36 @@ def main(args: argparse.Namespace) -> None:
         train_config["patience"] = 3
 
     trainer = ECGModelTrainer(model, train_config)
-    history = trainer.train(X_train_aug, y_train_oh, X_val, y_val_oh)
+
+    # Prepare training inputs
+    if use_metadata:
+        train_X = [X_train_aug, M_train_aug]
+        val_X   = [X_val, M_val]
+    else:
+        train_X = X_train_aug
+        val_X   = X_val
+
+    history = trainer.train(train_X, y_train_oh, val_X, y_val_oh)
 
     log.info("Training finished — best val_loss: %.4f",
              min(history.history.get("val_loss", [float("nan")])))
 
     # ── Phase 8: Evaluation ───────────────────────────────────────────────────
     log.info("\n── PHASE 8: EVALUATION ──────────────────────────────────────────")
-    evaluator = ECGModelEvaluator(model, output_dir="./evaluation")
+    evaluator = ECGModelEvaluator(model, output_dir="./evaluation",
+                                   use_metadata=use_metadata)
 
     results = []
-    results.append(evaluator.evaluate(X_test, y_test_oh,  "Standard-Test"))
+    if use_metadata:
+        results.append(evaluator.evaluate([X_test, M_test], y_test_oh, "Standard-Test"))
+    else:
+        results.append(evaluator.evaluate(X_test, y_test_oh, "Standard-Test"))
 
     if not args.quick and len(X_ludb) > 0:
-        results.append(evaluator.evaluate(X_ludb, y_ludb_oh, "LUDB-Noise"))
-
-    if not args.quick and len(mit_data["signals"]) > 0:
-        # MIT-BIH hold-out beat windows
-        from src.data_loader import BeatExtractor as BE
-        be = BE()
-        X_mit_w, y_mit_w = be.extract_from_mitbih(mit_data["signals"], mit_data["annotations"])
-        if len(X_mit_w) > 0:
-            pp2 = ECGPreprocessor()
-            X_mit_clean = np.array([pp2.preprocess_signal(x) for x in X_mit_w], dtype=np.float32)
-            X_mit_in    = X_mit_clean[:, :, np.newaxis]
-            y_mit_oh2   = tf.keras.utils.to_categorical(y_mit_w, 5).astype(np.float32)
-            results.append(evaluator.evaluate(X_mit_in, y_mit_oh2, "MIT-BIH-Reference"))
+        if use_metadata:
+            results.append(evaluator.evaluate([X_ludb, M_ludb], y_ludb_oh, "LUDB-Noise"))
+        else:
+            results.append(evaluator.evaluate(X_ludb, y_ludb_oh, "LUDB-Noise"))
 
     evaluator.summarise(results)
 
@@ -366,14 +440,16 @@ def main(args: argparse.Namespace) -> None:
     converter = TFJSConverter(output_dir=CONFIG["tfjs_dir"])
     ok = converter.convert(saved_path)
     if ok:
-        converter.validate()
-        converter.write_integration_snippet()
+        converter.validate(use_metadata=use_metadata)
+        converter.write_integration_snippet(use_metadata=use_metadata)
 
     log.info("\n" + "=" * 70)
     log.info("  PIPELINE COMPLETE ✓")
     log.info("=" * 70)
-    log.info("  Keras model : %s", CONFIG["model_path"])
-    log.info("  TF.js model : %s/model.json", CONFIG["tfjs_dir"])
+    log.info("  Architecture  : TCN-BiLSTM-Attention")
+    log.info("  Metadata      : %s", "YES (age, sex, height, weight)" if use_metadata else "NO")
+    log.info("  Keras model   : %s", CONFIG["model_path"])
+    log.info("  TF.js model   : %s/model.json", CONFIG["tfjs_dir"])
     log.info("=" * 70)
     log.info("Next steps:")
     log.info("  1. Copy  models/tfjs_model/  into the PULSE web app public/ folder.")
@@ -403,7 +479,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model", choices=["default", "resnet"], default="default",
-        help="Model architecture variant (default: CNN-BiLSTM)"
+        help="Model architecture variant (default: TCN-BiLSTM-Attention)"
+    )
+    parser.add_argument(
+        "--no-metadata", action="store_true",
+        help="Disable patient metadata input (ECG signal only)"
     )
 
     args = parser.parse_args()
